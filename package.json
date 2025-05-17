@@ -1,0 +1,27 @@
+{
+  "name": "vrack2-remote",
+  "version": "1.0.0",
+  "description": "VRack2 remote library",
+  "main": "/lib/index",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://gitlab.com/vrack2-group/vrack2-remote.git"
+  },
+  "author": "Boris Bobylev",
+  "license": "Apache-2.0",
+  "bugs": {
+    "url": "https://gitlab.com/vrack2-group/vrack2-remote/issues"
+  },
+  "homepage": "https://gitlab.com/vrack2-group/vrack2-remote#readme",
+  "dependencies": {
+    "crypto-js": "^4.2.0",
+    "events": "^3.3.0"
+  },
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/events": "^3.0.3"
+  }
+}

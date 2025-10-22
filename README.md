@@ -2,6 +2,8 @@
 
 Библиотека для взаимодействия с VRack2 сервером через защищенное соединение с поддержкой шифрования, команд и широковещательных каналов.
 
+Для работы с API VRack2 - рекомендуется ознакомиься с документом [VRack2 API](https://github.com/VRack2/vrack2/blob/main/docs/Api.md)
+
 ## Установка
 
 ```bash
@@ -10,12 +12,12 @@ npm install vrack2-remote
 
 ## Основные возможности
 
-- 🔒 Защищенное соединение с AES-CBC шифрованием
-- 📡 Поддержка команд и ответов с таймаутами
-- 📢 Широковещательные каналы (pub/sub)
-- 🔑 Двухэтапная аутентификация (API key + приватный ключ)
-- ⏱ Автоматическая очередь команд с таймаутами
-- 🚦 Контроль уровня доступа к командам
+- Защищенное соединение с AES-CBC шифрованием
+- Поддержка команд и ответов с таймаутами
+- Широковещательные каналы (pub/sub)
+- Двухэтапная аутентификация (API key + приватный ключ)
+- Автоматическая очередь команд с таймаутами
+- Контроль уровня доступа к командам
 
 ## Быстрый старт
 
@@ -68,7 +70,7 @@ if (remote.checkAccess('serviceUpdateList')) {
 
 ### Работа с каналами
 
-На один канал можно подключить только одну callback функцию. Вы можете повесить свой обработчик, который будет обрабатывать несколько callback функций.
+**На один канал можно подключить только одну callback функцию. Вы можете повесить свой обработчик, который будет обрабатывать несколько callback функций.**
 
 ```javascript
 // Подписка на канал
@@ -113,3 +115,123 @@ if (remote.connected) {} // ...
  - `cipher` - Флаг использования шифрования
  - `level` - Текущий уровень доступа (1000,3,2,1)
  - `commandsList` - Список доступных комманд
+
+
+Набросок простого компонента для получения онлайн данных на Vue3:
+
+```vue
+<template>
+  <div>
+    <h2>Монитор SmartBulb</h2>
+    <p>Статус: <strong>{{ status }}</strong></p>
+
+    <div v-if="rawData" class="data-container">
+      <pre>{{ rawData }}</pre>
+    </div>
+    <div v-else>
+      <p>Ожидание данных...</p>
+    </div>
+  </div>
+</template>
+
+<script>
+import { ref, inject } from 'vue'
+import VRackRemoteWeb from 'vrack2-remote'
+
+export default {
+  name: 'SmartBulbMonitor',
+
+  setup() {
+    const rawData = ref(null)
+    const status = ref('disconnected')
+    return {
+      rawData,
+      status
+    }
+  },
+
+  data() {
+    return {
+      remote: null,
+      HOST: 'ws://localhost:4044',
+      API_KEY: 'ваш_api_ключ',
+      PRIVATE_KEY: 'ваш_приватный_ключ'
+    }
+  },
+
+  watch: {
+    status(newStatus) {
+      // Можно добавить логику при изменении статуса, если нужно
+      console.log('Статус соединения:', newStatus)
+    }
+  },
+
+  mounted() {
+    this.connect()
+  },
+
+  methods: {
+
+    handleChannelData(data) {
+      this.rawData = data
+    },
+
+    async connect() {
+      try {
+        this.status = 'connecting'
+
+        // Создаем новый экземпляр соединения
+        this.remote = new VRackRemoteWeb(this.HOST, this.API_KEY, this.PRIVATE_KEY)
+
+        this.remote.on('open', () => {
+          console.log('Соединение установлено')
+        })
+
+        this.remote.on('close', () => {
+          console.log('Соединение закрыто')
+          this.status = 'disconnected'
+        })
+
+        this.remote.on('error', (err) => {
+          console.error('Ошибка соединения:', err)
+          this.status = 'error'
+        })
+
+        // Попытка соединения
+        await this.remote.connect()
+        // Авторизация - отправка ключей и тп
+        await this.remote.apiKeyAuth()
+        // Обновление списка доступных команд с правами
+        await this.remote.commandsListUpdate()
+        // Подписываемся на канал и устанавливаем обработчик обновленных данных
+        await this.remote.channelJoin('services.smart-light.devices.SmartBulb.render', this.handleChannelData)
+        this.status = 'connected'
+      } catch (error) {
+        console.error('Ошибка при подключении:', error)
+        this.status = 'error'
+      }
+    },
+
+    async disconnect() {
+      if (!this.remote) return
+      this.remote = null
+      this.status = 'disconnected'
+    }
+  }
+}
+</script>
+
+<style scoped>
+.data-container {
+  background: #f5f5f5;
+  padding: 12px;
+  margin-top: 12px;
+  font-family: monospace;
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+}
+</style>
+```

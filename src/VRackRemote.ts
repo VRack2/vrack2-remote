@@ -1,48 +1,174 @@
-import CryptoJS from 'crypto-js'
 import { EventEmitter } from 'events'
 
-/**
- * VRackRemote - A transport class for VRack2 remote communication
- * 
- * This class handles encrypted communication with VRack2 servers, including:
- * - Connection management
- * - Command execution with queuing
- * - Channel-based broadcasting
- * - Authentication
- * - Data encryption/decryption
+/*
+ * VRackRemote — VRack2 client transport (new "v2" protocol).
+ *
+ * The channel is protected with standardized primitives only (no legacy AES-CBC):
+ *   • asymmetric key material  — ECDH P-256
+ *   • channel key `ek`         — HKDF-SHA256 (32 bytes)
+ *   • authenticated frames     — AES-256-GCM  (base64url(nonce ‖ ciphertext ‖ tag))
+ *
+ * Every frame is bound to one session via AAD `{ c: clientId, s: seq, d: req|res, v: verify }`,
+ * which defeats replay and cross-session/cross-direction transfer. The crypto backend is the
+ * standard WebCrypto API (`crypto.subtle`), so the same code runs in a browser (secure context)
+ * and in Node.js (>= 15).
+ *
+ * Three key modes are supported automatically (decided by the `apiKeyAuth` answer):
+ *   • plain      — no `verify`        -> channel stays plain JSON
+ *   • ecdh       — `verify`+`serverPub`-> ECDH channel, GCM frames (modern)
+ *   • legacy     — `verify` only       -> shared-secret HKDF channel, GCM frames (compat)
  */
+
+/** A single decoded VRack2 message (request echo / response / broadcast). */
+export interface VRack2Message {
+    command?: string
+    _pkgIndex?: number
+    result?: 'success' | 'error' | string
+    resultData?: any
+    /** Assigned by the server on the connection (present in apiKeyAuth answers). */
+    clientId?: number
+    target?: string
+    data?: any
+    [key: string]: any
+}
+
+/* ----------------------------- WebCrypto backend ----------------------------- */
+
+function subtle(): SubtleCrypto {
+    const c: any = (globalThis as any).crypto
+    if (!c || !c.subtle) throw new Error('crypto.subtle is unavailable — use a secure context (https / localhost) in the browser, or Node.js >= 15')
+    return c.subtle
+}
+
+function randomBytes(n: number): Uint8Array {
+    const c: any = (globalThis as any).crypto
+    if (!c || typeof c.getRandomValues !== 'function') throw new Error('crypto.getRandomValues is unavailable — use Node.js >= 15 or a modern browser')
+    const buf = new Uint8Array(n)
+    c.getRandomValues(buf)
+    return buf
+}
+
+/** base64url (RFC 4648, no padding) encode. */
+function b64urlEncode(bytes: Uint8Array): string {
+    let bin = ''
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/** base64url decode. */
+function b64urlDecode(str: string): Uint8Array {
+    let s = str.replace(/-/g, '+').replace(/_/g, '/')
+    while (s.length % 4 !== 0) s += '='
+    const bin = atob(s)
+    const out = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
+    return out
+}
+
+/** Strip PEM headers / whitespace -> raw DER ArrayBuffer. */
+function pemToDer(pem: string): ArrayBuffer {
+    const b64 = pem.replace(/-----(BEGIN|END)[A-Z0-9 ]+-----/g, '').replace(/\s+/g, '')
+    const bin = atob(b64)
+    const bytes = new Uint8Array(bin.length)
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+    return bytes.buffer
+}
+
+/** HKDF-SHA256 key expansion to `length` bytes. (WebCrypto needs the IKM imported as a CryptoKey.) */
+async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: string, length: number): Promise<Uint8Array> {
+    const ikmKey = await subtle().importKey('raw', ikm, { name: 'HKDF' }, false, ['deriveBits'])
+    const bits = await subtle().deriveBits(
+        { name: 'HKDF', hash: 'SHA-256', salt: salt, info: new TextEncoder().encode(info) },
+        ikmKey,
+        length * 8
+    )
+    return new Uint8Array(bits)
+}
+
+/**
+ * Asymmetric channel key: ECDH(clientPriv, serverPub) -> HKDF(salt=∅, info="vrack2/v2/ek").
+ * Matches the server `Guard.deriveEK` (ECDH branch).
+ */
+async function deriveEkEcdh(serverPubPem: string, clientPrivPem: string): Promise<Uint8Array> {
+    const priv = await subtle().importKey('pkcs8', pemToDer(clientPrivPem), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
+    const pub = await subtle().importKey('spki', pemToDer(serverPubPem), { name: 'ECDH', namedCurve: 'P-256' }, false, [])
+    const shared = new Uint8Array(await subtle().deriveBits({ name: 'ECDH', public: pub }, priv, 256))
+    return hkdf(shared, new Uint8Array(0), 'vrack2/v2/ek', 32)
+}
+
+/**
+ * Legacy shared-secret channel key: HKDF(ikm=secret, salt="vrack2/v2", info="vrack2/v2/ek").
+ * Matches the server `Guard.deriveEK` (shared-secret branch).
+ */
+async function deriveEkLegacy(secret: string): Promise<Uint8Array> {
+    return hkdf(new TextEncoder().encode(secret), new TextEncoder().encode('vrack2/v2'), 'vrack2/v2/ek', 32)
+}
+
+/** AAD binding the frame to session/channel/sequence/direction. Must match the server byte-for-byte. */
+function buildAAD(clientId: number, seq: number, dir: 'req' | 'res', session: string): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify({ c: clientId, s: seq, d: dir, v: session }))
+}
+
+/** Encrypt `payload` into a frame: base64url(nonce ‖ ciphertext ‖ tag), AES-256-GCM. */
+async function frameEncrypt(payload: string, ek: Uint8Array, clientId: number, seq: number, dir: 'req' | 'res', session: string): Promise<string> {
+    const key = await subtle().importKey('raw', ek, { name: 'AES-GCM' }, false, ['encrypt'])
+    const nonce = randomBytes(12)
+    const ct = new Uint8Array(await subtle().encrypt(
+        { name: 'AES-GCM', iv: nonce, additionalData: buildAAD(clientId, seq, dir, session) },
+        key,
+        new TextEncoder().encode(payload)
+    ))
+    const out = new Uint8Array(12 + ct.length)
+    out.set(nonce, 0)
+    out.set(ct, 12)
+    return b64urlEncode(out)
+}
+
+/** Decrypt a frame back into `payload`. Throws on a bad tag / AAD / sequence / key. */
+async function frameDecrypt(frame: string, ek: Uint8Array, clientId: number, seq: number, dir: 'req' | 'res', session: string): Promise<string> {
+    const raw = b64urlDecode(frame)
+    if (raw.length < 28) throw new Error('Frame too short')
+    const nonce = raw.subarray(0, 12)
+    const ct = raw.subarray(12) // ciphertext + 16-byte auth tag
+    const key = await subtle().importKey('raw', ek, { name: 'AES-GCM' }, false, ['decrypt'])
+    const pt = new Uint8Array(await subtle().decrypt(
+        { name: 'AES-GCM', iv: nonce, additionalData: buildAAD(clientId, seq, dir, session) },
+        key,
+        ct
+    ))
+    return new TextDecoder().decode(pt)
+}
+
+/* ----------------------------- Transport class ----------------------------- */
+
 export default class VRackRemote extends EventEmitter {
-    // Protected properties
-    protected key = 'default'                      // Default API key
-    protected privateKey = ''                      // Private key for encryption
-    protected pkgIndex = 1000                      // Package index counter
-    protected channels = new Map<string, (data: any) => void>()  // Active channels
-    protected queue = new Map<number, {            // Command queue
-        resolve: (value: unknown) => void,
-        reject: (error: Error) => void
-    }>()
-    protected queueTimeout = new Map<number, number>() // Queue timeouts
+    // Credentials
+    protected key = 'default'               // KID (public key identifier)
+    protected privateKey = ''              // PEM private key (ECDH) or shared secret (legacy)
 
-    // Public properties
-    level = 1000                                   // Access level
-    timeout = 30000                                // Command timeout in ms
-    connected = false                              // Connection status
-    connection = false                             // Connection in progress flag
-    cipher = false                                 // Encryption enabled flag
-    commandsList: {
-        [key: string]: {              // Available commands list
-            command: string,
-            description: string,
-            level: number
-        }
-    } = {}
+    // Bookkeeping
+    protected pkgIndex = 1000              // _pkgIndex counter (request/response correlation)
+    protected channels = new Map<string, (data: any) => void>()
+    protected queue = new Map<number, { resolve: (value: any) => void, reject: (error: Error) => void }>()
+    protected queueTimeout = new Map<number, ReturnType<typeof setTimeout>>()
+    private sendChain: Promise<unknown> = Promise.resolve()  // serializes wire writes so frame order == seq order
 
-    /**
-     * Constructor
-     * 
-     * @param key - API key (default: 'default')
-     * @param privateKey - Private key for encryption (default: '')
-     */
+    // Public state
+    level = 1000                           // access level (1/2/3/1000)
+    timeout = 30000                        // command timeout (ms)
+    connected = false                      // connection is up
+    connection = false                     // connection in progress
+    cipher = false                         // channel is encrypted (GCM frames)
+    mode: 'plain' | 'ecdh' | 'legacy' | null = null  // negotiated key mode
+    commandsList: { [command: string]: { command: string, description: string, level: number, [k: string]: any } } = {}
+
+    // Negotiated session state (set during apiKeyAuth)
+    clientId: number | null = null         // server-assigned connection id (AAD `c`)
+    session: string | null = null          // server challenge `verify` (AAD `v`)
+    ek: Uint8Array | null = null           // 32-byte channel key
+    reqSeq = 1                             // outbound (req) sequence, starts at 1
+    resSeq = 1                             // inbound  (res) sequence, starts at 1
+
     constructor(key = 'default', privateKey = '') {
         super()
         this.setKey(key)
@@ -51,133 +177,105 @@ export default class VRackRemote extends EventEmitter {
 
     /**********  Key Management  ***************/
 
-    /**
-     * Set the API key
-     * 
-     * @param key - New API key (default: 'default')
-     */
+    /** Set the KID (public key identifier). */
     setKey(key = 'default') {
         this.key = key
     }
 
-    /**
-     * Set the private key for encryption
-     * 
-     * @param privateKey - New private key (default: '')
-     */
+    /** Set the private key: PEM (ECDH) or shared secret (legacy). Mode is auto-detected from the server answer. */
     setPrivateKey(privateKey = '') {
         this.privateKey = privateKey
     }
 
     /**********  Transport Events  ***************/
 
-    /**
-     * Handle transport connection open
-     */
     protected transportOnOpen() {
         this.connected = true
         this.connection = false
         this.emit('open')
     }
 
-    /**
-     * Handle transport connection close
-     */
     protected transportOnClose() {
         this.connected = false
         this.connection = false
         this.cipher = false
         this.level = 1000
+        this.mode = null
+        this.clientId = null
+        this.session = null
+        this.ek = null
+        this.reqSeq = 1
+        this.resSeq = 1
         this.channels.clear()
         this.emit('close')
     }
 
-    /**
-     * Handle transport error
-     * 
-     * @param error - Error object
-     */
     protected transportOnError(error: Error) {
         this.emit('error', error)
     }
 
     /**
-     * Handle incoming message
-     * 
-     * @param data - Received message data
+     * Handle an incoming message. If the channel is cipher-enabled the message is a GCM frame
+     * (the raw base64url string); otherwise it is plain JSON (handshake or a plain key).
      */
-    protected transportOnMessage(data: string) {
-        // Decrypt data if encryption is enabled
-        if (this.cipher) data = this.decipherData(data)
-
-        const remoteData = JSON.parse(data)
-
-        // Handle command responses
-        if (remoteData._pkgIndex) {
-            if (this.queue.has(remoteData._pkgIndex)) {
-                clearTimeout(this.queueTimeout.get(remoteData._pkgIndex))
-                const func = this.queue.get(remoteData._pkgIndex)
-
-                if (func && remoteData.result === 'error') {
-                    func.reject(this.errorify(remoteData.resultData))
-                } else if (func) {
-                    func.resolve(remoteData.resultData)
-                }
-
-                this.queue.delete(remoteData._pkgIndex)
-                this.queueTimeout.delete(remoteData._pkgIndex)
+    protected async transportOnMessage(data: string) {
+        let text = data
+        if (this.cipher) {
+            const seq = this.resSeq++
+            try {
+                text = await frameDecrypt(data, this.ek as Uint8Array, this.clientId as number, seq, 'res', this.session as string)
+            } catch (error) {
+                // A failing auth tag means the channel is corrupted (replay / tamper / seq skew):
+                // surface it and stop trusting the connection.
+                this.transportOnError(error instanceof Error ? error : new Error('Frame decrypt failed'))
+                return
             }
         }
-        // Handle broadcast messages
-        else if (remoteData.command === 'broadcast') {
-            if (this.channels.has(remoteData.target)) {
-                const cb = this.channels.get(remoteData.target)
-                if (cb) cb(remoteData)
-            }
+
+        let remoteData: VRack2Message
+        try {
+            remoteData = JSON.parse(text)
+        } catch (error) {
+            this.transportOnError(error instanceof Error ? error : new Error('Invalid JSON from server'))
+            return
+        }
+
+        if (remoteData._pkgIndex != null && this.queue.has(remoteData._pkgIndex)) {
+            const func = this.queue.get(remoteData._pkgIndex) as { resolve: (v: any) => void, reject: (e: Error) => void }
+            const timer = this.queueTimeout.get(remoteData._pkgIndex)
+            if (timer) clearTimeout(timer)
+            this.queue.delete(remoteData._pkgIndex)
+            this.queueTimeout.delete(remoteData._pkgIndex)
+            if (remoteData.result === 'error') func.reject(this.errorify(remoteData.resultData))
+            else func.resolve(remoteData)
+        } else if (remoteData.command === 'broadcast') {
+            const cb = this.channels.get(remoteData.target as string)
+            if (cb) cb(remoteData)
         }
     }
 
     /**********  Transport Methods (To be overridden)  ***************/
 
-    /**
-     * Send data through transport
-     * 
-     * @param data - Data to send
-     */
     protected transportSend(data: string) {
-        // To be implemented by child classes
+        // Implemented by a concrete transport (e.g. VRackRemoteWeb over WebSocket).
     }
 
-    /**
-     * Disconnect transport
-     */
     protected transportDisconnect() {
-        // To be implemented by child classes
+        // Implemented by a concrete transport.
     }
 
     /**********  Channel Methods  ***************/
 
-    /**
-     * Join a broadcast channel
-     * 
-     * @param channel - Channel name
-     * @param cb - Callback function for broadcast messages
-     * @returns Promise with join result
-     */
+    /** Join a broadcast channel. */
     async channelJoin(channel: string, cb: (data: any) => void) {
-        const result = this.command('channelJoin', { channel: channel })
+        const result = this.command('channelJoin', { channel })
         this.channels.set(channel, cb)
         return result
     }
 
-    /**
-     * Leave a broadcast channel
-     * 
-     * @param channel - Channel name
-     * @returns Promise with leave result
-     */
+    /** Leave a broadcast channel. */
     async channelLeave(channel: string) {
-        const result = await this.command('channelLeave', { channel: channel })
+        const result = await this.command('channelLeave', { channel })
         this.channels.delete(channel)
         return result
     }
@@ -185,134 +283,137 @@ export default class VRackRemote extends EventEmitter {
     /**********  Authentication Methods  ***************/
 
     /**
-     * Authenticate using API key
-     * 
-     * @returns Promise with authentication result
+     * Authenticate. Sends `apiKeyAuth`; if the key requires a cipher channel it performs the
+     * `apiPrivateAuth` proof (encrypts the server challenge as the first req frame) and derives
+     * the channel key. After a successful proof the channel is encrypted.
      */
-    async apiKeyAuth() {
-        let result = await this.command('apiKeyAuth', { key: this.key })
+    async apiKeyAuth(): Promise<any> {
+        const auth = await this.send('apiKeyAuth', { key: this.key })
+        const rd = (auth.resultData || {}) as any
+        this.clientId = auth.clientId != null ? auth.clientId : null
+        this.session = null
+        this.ek = null
+        this.reqSeq = 1
+        this.resSeq = 1
 
-        // If server requires additional private key authentication
-        if (result.cipher) {
-            result = await this.command('apiPrivateAuth', {
-                verify: this.cipherData(result.verify).toString()
-            })
+        if (!rd.verify) {
+            // Plain key — the channel is already usable, no cipher.
+            this.mode = 'plain'
+            this.cipher = false
+            this.level = rd.level
+            return rd
         }
 
-        this.level = result.level
-        this.cipher = result.cipher
-        return result
+        // Cipher key — need the secret to derive the channel key.
+        if (!this.privateKey) throw new Error('This key requires encryption (verify), but no private key was set (setPrivateKey)')
+        this.session = rd.verify
+
+        if (rd.serverPub) {
+            this.mode = 'ecdh'
+            this.ek = await deriveEkEcdh(rd.serverPub, this.privateKey)
+        } else {
+            this.mode = 'legacy'
+            this.ek = await deriveEkLegacy(this.privateKey)
+        }
+
+        // Proof: encrypt the server challenge as the first outbound frame (req seq = 1).
+        // The apiPrivateAuth request and its answer are plain JSON; only after this do we frame.
+        const frame = await frameEncrypt(rd.verify, this.ek, this.clientId as number, 1, 'req', rd.verify)
+        const proof = await this.send('apiPrivateAuth', { frame })
+        this.cipher = true
+        this.level = proof.resultData ? proof.resultData.level : this.level
+        this.reqSeq = 2 // proof consumed req seq 1; next command is 2
+        this.resSeq = 1 // the proof answer is plain, so the first framed answer is res seq 1
+        return proof.resultData
     }
 
-    /**
-     * Update available commands list from server
-     * 
-     * @returns Promise with commands list
-     */
+    /** Update the available-commands list from the server. */
     async commandsListUpdate() {
-        this.commandsList = await this.command('commandsList', {})
+        const list = await this.command('commandsList', {})
+        if (Array.isArray(list)) {
+            const obj: typeof this.commandsList = {}
+            for (const item of list) {
+                if (item && item.command) obj[item.command] = item
+            }
+            this.commandsList = obj
+        } else {
+            this.commandsList = list || {}
+        }
     }
 
     /**********  Utility Methods  ***************/
 
-    /**
-     * Check if current access level allows executing a command
-     * 
-     * @param command - Command name to check
-     * @returns True if access is allowed, false otherwise
-     */
+    /** True if the current access level is enough to run `command`. */
     checkAccess(command: string) {
-        if (this.commandsList[command] &&
-            this.level <= this.commandsList[command].level) return true
-        return false
+        const entry = this.commandsList[command]
+        return !!(entry && this.level <= entry.level)
     }
 
     /**
-     * Encrypt data using AES-CBC
-     * 
-     * @param data - Data to encrypt
-     * @returns Encrypted data
-     */
-    protected cipherData(data: string) {
-        return CryptoJS.AES.encrypt(data, CryptoJS.enc.Utf8.parse(this.privateKey), {
-            iv: CryptoJS.enc.Utf8.parse(this.key),
-            mode: CryptoJS.mode.CBC
-        })
-    }
-
-    /**
-     * Decrypt data using AES-CBC
-     * 
-     * @param data - Data to decrypt
-     * @returns Decrypted data
-     */
-    protected decipherData(data: string) {
-        const res = CryptoJS.AES.decrypt(data, CryptoJS.enc.Utf8.parse(this.privateKey), {
-            iv: CryptoJS.enc.Utf8.parse(this.key),
-            mode: CryptoJS.mode.CBC
-        })
-        return res.toString(CryptoJS.enc.Utf8)
-    }
-
-    /**
-     * Execute a remote command
-     * 
-     * @param command - Command name
-     * @param params - Command parameters
-     * @returns Promise with command result
+     * Execute a command and resolve with its `resultData`. Rejects on a server error or timeout.
      */
     command(command: string, params: any): Promise<any> {
-        return new Promise((resolve, reject) => {
-            const send = {
-                command: command,
-                _pkgIndex: this.pkgIndex++,
-                data: params
-            }
-            this.addToQueue(send, resolve, reject)
-        })
+        return this.send(command, params).then((resp) => (resp && resp.resultData))
     }
 
     /**
-     * Add command to execution queue
-     * 
-     * @param params - Command parameters including package index
-     * @param resolve - Promise resolve function
-     * @param reject - Promise reject function
+     * Send one command and resolve with the full decoded response (including `clientId`).
+     *
+     * The `req` sequence is captured synchronously (call order), and the whole
+     * "encrypt → write" step is serialized on a FIFO chain, so frames always leave the wire
+     * in `reqSeq` order even when several commands are in flight and WebCrypto resolves out of
+     * order. A failed write rejects this command's promise (and the channel must be reset).
      */
-    protected addToQueue(
-        params: { command: string, _pkgIndex: number, data: any },
-        resolve: (value: unknown) => void,
-        reject: (error: Error) => void
-    ) {
-        // Add to queue
-        this.queue.set(params._pkgIndex, { resolve, reject })
+    protected send(command: string, data: any): Promise<VRack2Message> {
+        if (!this.connected) return Promise.reject(new Error('Socket is closed'))
 
-        // Set timeout
-        this.queueTimeout.set(params._pkgIndex, setTimeout(() => {
-            reject(new Error('Timeout'))
-            this.queue.delete(params._pkgIndex)
-            this.queueTimeout.delete(params._pkgIndex)
+        const _pkgIndex = this.pkgIndex++
+        const reqSeq = this.cipher ? this.reqSeq++ : 0
+        const payload = JSON.stringify({ command, _pkgIndex, data })
+
+        let settle!: (resp: VRack2Message) => void
+        let fail!: (err: Error) => void
+        const result = new Promise<VRack2Message>((resolve, reject) => { settle = resolve; fail = reject })
+
+        // Register the response slot + timeout before flushing the write (a fast reply can't be lost).
+        this.queue.set(_pkgIndex, { resolve: settle, reject: fail })
+        this.queueTimeout.set(_pkgIndex, setTimeout(() => {
+            this.dropResponse(_pkgIndex)
+            fail(new Error(`Timeout waiting for response #${_pkgIndex} (${this.timeout}ms)`))
         }, this.timeout))
 
-        // Send immediately if connected
-        if (!this.connected) reject(new Error('Socket is closed'))
+        const job = async () => {
+            const text = this.cipher
+                ? await frameEncrypt(payload, this.ek as Uint8Array, this.clientId as number, reqSeq, 'req', this.session as string)
+                : payload
+            this.transportSend(text)
+        }
+        const runJob = this.sendChain.then(() => job())
+        this.sendChain = runJob.catch((e) => {
+            const err = e instanceof Error ? e : new Error(String(e))
+            this.dropResponse(_pkgIndex)
+            fail(err)
+        })
 
-        let data = JSON.stringify(params)
-        if (this.cipher) data = this.cipherData(data).toString()
-        this.transportSend(data)
+        return result
     }
 
-    /**
-     * Convert error-like object to Error instance
-     * 
-     * @param error - Error object to convert
-     * @returns Proper Error instance
-     */
-    protected errorify(error: any) {
-        const result = new Error()
-        const keys = Object.getOwnPropertyNames(error)
-        for (const key of keys) {
-            result[key as keyof Error] = error[key]
+    private dropResponse(_pkgIndex: number) {
+        const timer = this.queueTimeout.get(_pkgIndex)
+        if (timer) clearTimeout(timer)
+        this.queue.delete(_pkgIndex)
+        this.queueTimeout.delete(_pkgIndex)
+    }
+
+    /** Convert a server error payload into a proper Error instance (message + copied fields). */
+    protected errorify(error: any): Error {
+        const message = (error && (error.message || error.errorId || error.error || error.code)) || 'VRack2 error'
+        const result: any = new Error(typeof message === 'string' ? message : JSON.stringify(message))
+        if (error && typeof error === 'object') {
+            for (const key of Object.getOwnPropertyNames(error)) {
+                try { result[key] = (error as any)[key] } catch { /* non-writable, ignore */ }
+            }
+            result.message = message
         }
         return result
     }

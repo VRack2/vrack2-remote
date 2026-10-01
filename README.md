@@ -143,6 +143,41 @@ if (remote.connected) {} // ...
 
 > Важно: используйте `wss://` в продакшене — WebCrypto требует безопасного контекста (https/localhost). Храните приватный ECDH ключ (PEM) отдельно, он выдаётся один раз при создании ключа.
 
+## Криптография (класс `V2Crypto`)
+
+Вся криптография (ECDH P-256 / HKDF-SHA256 / AES-256-GCM) вынесена в отдельный класс `V2Crypto` (`src/crypt.ts`), отделённый от транспорта и веб-слоя. Бэкенд — стандартный WebCrypto (`crypto.subtle`); `(globalThis as any).crypto` больше не используется. Класс можно использовать и самостоятельно:
+
+```javascript
+import { V2Crypto } from 'vrack2-remote'
+
+const v2 = new V2Crypto()
+
+// ECDH: ключ канала из приватного PEM и публичного ключа сервера (PEM или base64url)
+const ek = await v2.deriveEcdhChannelKey(privateKeyPem, serverPub)
+
+// Legacy: ключ канала из общего секрета
+const ekLegacy = await v2.deriveLegacyChannelKey('общий_секрет')
+
+// Кадрирование: base64url(nonce ‖ ciphertext ‖ tag), AAD = clientId|seq|dir|session
+const frame = await v2.frameEncrypt(ek, '{"command":"serviceList"}', 42, 7, 'req', 'session')
+const text  = await v2.frameDecrypt(ek, frame, 42, 7, 'req', 'session')
+
+// Генерация новой пары ключей (для создания ECDH-ключа)
+const { privateKey, publicKeyPem } = await v2.generateEcdhKeyPair()
+```
+
+Методы `V2Crypto`:
+
+- `generateEcdhKeyPair()` — генерация пары P-256 → `{ privateKey, publicKeyPem }`
+- `importEcdhPrivateKey(pem)` — импорт приватного ключа (PEM) → `CryptoKey`
+- `importEcdhPublicKey(serverPub)` — импорт публичного ключа (PEM/base64url) → `CryptoKey`
+- `deriveShared(privateKey, publicKey)` — общий секрет ECDH (32 байта)
+- `hkdfExpand(ikm)` — HKDF-SHA256 до 32 байт
+- `deriveEcdhChannelKey(privateKeyPem, serverPub)` — готовый ключ канала (ECDH)
+- `deriveLegacyChannelKey(secret)` — готовый ключ канала (общий секрет)
+- `frameEncrypt(key, payload, clientId, seq, dir, session)` — шифрованный кадр
+- `frameDecrypt(key, frame, clientId, seq, dir, session)` — расшифровка кадра (проверка AAD)
+
 
 Набросок простого компонента для получения онлайн данных на Vue3:
 

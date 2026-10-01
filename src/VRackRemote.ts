@@ -1,14 +1,15 @@
 import { EventEmitter } from 'events'
+import { V2Crypto } from './crypt'
 
 /*
  * VRackRemote — VRack2 client transport (new "v2" protocol).
  *
- * The channel is protected with standardized primitives only (no legacy AES-CBC):
- *   • asymmetric key material  — ECDH P-256
- *   • channel key `ek`         — HKDF-SHA256 (32 bytes)
- *   • authenticated frames     — AES-256-GCM  (base64url(nonce ‖ ciphertext ‖ tag))
+ * The channel is protected with standardized primitives (see ./crypt.ts for the crypto class):
+ *   • asymmetric key material — ECDH P-256
+ *   • channel key `ek`        — HKDF-SHA256 (32 bytes)
+ *   • authenticated frames    — AES-256-GCM  (base64url(nonce ‖ ciphertext ‖ tag))
  *
- * Every frame is bound to one session via AAD `{ c: clientId, s: seq, d: req|res, v: verify }`,
+ * Every frame is bound to one session via AAD `{ c: clientId, s: seq, d: req|res, v: session }`,
  * which defeats replay and cross-session/cross-direction transfer. The crypto backend is the
  * standard WebCrypto API (`crypto.subtle`), so the same code runs in a browser (secure context)
  * and in Node.js (>= 15).
@@ -32,115 +33,6 @@ export interface VRack2Message {
     [key: string]: any
 }
 
-/* ----------------------------- WebCrypto backend ----------------------------- */
-
-function subtle(): SubtleCrypto {
-    const c: any = (globalThis as any).crypto
-    if (!c || !c.subtle) throw new Error('crypto.subtle is unavailable — use a secure context (https / localhost) in the browser, or Node.js >= 15')
-    return c.subtle
-}
-
-function randomBytes(n: number): Uint8Array {
-    const c: any = (globalThis as any).crypto
-    if (!c || typeof c.getRandomValues !== 'function') throw new Error('crypto.getRandomValues is unavailable — use Node.js >= 15 or a modern browser')
-    const buf = new Uint8Array(n)
-    c.getRandomValues(buf)
-    return buf
-}
-
-/** base64url (RFC 4648, no padding) encode. */
-function b64urlEncode(bytes: Uint8Array): string {
-    let bin = ''
-    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i])
-    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-/** base64url decode. */
-function b64urlDecode(str: string): Uint8Array {
-    let s = str.replace(/-/g, '+').replace(/_/g, '/')
-    while (s.length % 4 !== 0) s += '='
-    const bin = atob(s)
-    const out = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i)
-    return out
-}
-
-/** Strip PEM headers / whitespace -> raw DER ArrayBuffer. */
-function pemToDer(pem: string): ArrayBuffer {
-    const b64 = pem.replace(/-----(BEGIN|END)[A-Z0-9 ]+-----/g, '').replace(/\s+/g, '')
-    const bin = atob(b64)
-    const bytes = new Uint8Array(bin.length)
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-    return bytes.buffer
-}
-
-/** HKDF-SHA256 key expansion to `length` bytes. (WebCrypto needs the IKM imported as a CryptoKey.) */
-async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: string, length: number): Promise<Uint8Array> {
-    const ikmKey = await subtle().importKey('raw', ikm, { name: 'HKDF' }, false, ['deriveBits'])
-    const bits = await subtle().deriveBits(
-        { name: 'HKDF', hash: 'SHA-256', salt: salt, info: new TextEncoder().encode(info) },
-        ikmKey,
-        length * 8
-    )
-    return new Uint8Array(bits)
-}
-
-/**
- * Asymmetric channel key: ECDH(clientPriv, serverPub) -> HKDF(salt=∅, info="vrack2/v2/ek").
- * Matches the server `Guard.deriveEK` (ECDH branch).
- */
-async function deriveEkEcdh(serverPubPem: string, clientPrivPem: string): Promise<Uint8Array> {
-    const priv = await subtle().importKey('pkcs8', pemToDer(clientPrivPem), { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits'])
-    const pub = await subtle().importKey('spki', pemToDer(serverPubPem), { name: 'ECDH', namedCurve: 'P-256' }, false, [])
-    const shared = new Uint8Array(await subtle().deriveBits({ name: 'ECDH', public: pub }, priv, 256))
-    return hkdf(shared, new Uint8Array(0), 'vrack2/v2/ek', 32)
-}
-
-/**
- * Legacy shared-secret channel key: HKDF(ikm=secret, salt="vrack2/v2", info="vrack2/v2/ek").
- * Matches the server `Guard.deriveEK` (shared-secret branch).
- */
-async function deriveEkLegacy(secret: string): Promise<Uint8Array> {
-    return hkdf(new TextEncoder().encode(secret), new TextEncoder().encode('vrack2/v2'), 'vrack2/v2/ek', 32)
-}
-
-/** AAD binding the frame to session/channel/sequence/direction. Must match the server byte-for-byte. */
-function buildAAD(clientId: number, seq: number, dir: 'req' | 'res', session: string): Uint8Array {
-    return new TextEncoder().encode(JSON.stringify({ c: clientId, s: seq, d: dir, v: session }))
-}
-
-/** Encrypt `payload` into a frame: base64url(nonce ‖ ciphertext ‖ tag), AES-256-GCM. */
-async function frameEncrypt(payload: string, ek: Uint8Array, clientId: number, seq: number, dir: 'req' | 'res', session: string): Promise<string> {
-    const key = await subtle().importKey('raw', ek, { name: 'AES-GCM' }, false, ['encrypt'])
-    const nonce = randomBytes(12)
-    const ct = new Uint8Array(await subtle().encrypt(
-        { name: 'AES-GCM', iv: nonce, additionalData: buildAAD(clientId, seq, dir, session) },
-        key,
-        new TextEncoder().encode(payload)
-    ))
-    const out = new Uint8Array(12 + ct.length)
-    out.set(nonce, 0)
-    out.set(ct, 12)
-    return b64urlEncode(out)
-}
-
-/** Decrypt a frame back into `payload`. Throws on a bad tag / AAD / sequence / key. */
-async function frameDecrypt(frame: string, ek: Uint8Array, clientId: number, seq: number, dir: 'req' | 'res', session: string): Promise<string> {
-    const raw = b64urlDecode(frame)
-    if (raw.length < 28) throw new Error('Frame too short')
-    const nonce = raw.subarray(0, 12)
-    const ct = raw.subarray(12) // ciphertext + 16-byte auth tag
-    const key = await subtle().importKey('raw', ek, { name: 'AES-GCM' }, false, ['decrypt'])
-    const pt = new Uint8Array(await subtle().decrypt(
-        { name: 'AES-GCM', iv: nonce, additionalData: buildAAD(clientId, seq, dir, session) },
-        key,
-        ct
-    ))
-    return new TextDecoder().decode(pt)
-}
-
-/* ----------------------------- Transport class ----------------------------- */
-
 export default class VRackRemote extends EventEmitter {
     // Credentials
     protected key = 'default'               // KID (public key identifier)
@@ -152,6 +44,12 @@ export default class VRackRemote extends EventEmitter {
     protected queue = new Map<number, { resolve: (value: any) => void, reject: (error: Error) => void }>()
     protected queueTimeout = new Map<number, ReturnType<typeof setTimeout>>()
     private sendChain: Promise<unknown> = Promise.resolve()  // serializes wire writes so frame order == seq order
+
+    // Crypto (created lazily — plain keys never need it, and it must not break their construction)
+    private _v2?: V2Crypto
+    private get v2(): V2Crypto {
+        return this._v2 ?? (this._v2 = new V2Crypto())
+    }
 
     // Public state
     level = 1000                           // access level (1/2/3/1000)
@@ -165,7 +63,7 @@ export default class VRackRemote extends EventEmitter {
     // Negotiated session state (set during apiKeyAuth)
     clientId: number | null = null         // server-assigned connection id (AAD `c`)
     session: string | null = null          // server challenge `verify` (AAD `v`)
-    ek: Uint8Array | null = null           // 32-byte channel key
+    ek: CryptoKey | null = null            // AES-256-GCM channel key (set after proof)
     reqSeq = 1                             // outbound (req) sequence, starts at 1
     resSeq = 1                             // inbound  (res) sequence, starts at 1
 
@@ -223,7 +121,7 @@ export default class VRackRemote extends EventEmitter {
         if (this.cipher) {
             const seq = this.resSeq++
             try {
-                text = await frameDecrypt(data, this.ek as Uint8Array, this.clientId as number, seq, 'res', this.session as string)
+                text = await this.v2.frameDecrypt(this.ek as CryptoKey, data, this.clientId as number, seq, 'res', this.session as string)
             } catch (error) {
                 // A failing auth tag means the channel is corrupted (replay / tamper / seq skew):
                 // surface it and stop trusting the connection.
@@ -308,17 +206,13 @@ export default class VRackRemote extends EventEmitter {
         if (!this.privateKey) throw new Error('This key requires encryption (verify), but no private key was set (setPrivateKey)')
         this.session = rd.verify
 
-        if (rd.serverPub) {
-            this.mode = 'ecdh'
-            this.ek = await deriveEkEcdh(rd.serverPub, this.privateKey)
-        } else {
-            this.mode = 'legacy'
-            this.ek = await deriveEkLegacy(this.privateKey)
-        }
+        if (rd.serverPub) this.ek = await this.v2.deriveEcdhChannelKey(this.privateKey, rd.serverPub)
+        else this.ek = await this.v2.deriveLegacyChannelKey(this.privateKey)
+        this.mode = rd.serverPub ? 'ecdh' : 'legacy'
 
         // Proof: encrypt the server challenge as the first outbound frame (req seq = 1).
         // The apiPrivateAuth request and its answer are plain JSON; only after this do we frame.
-        const frame = await frameEncrypt(rd.verify, this.ek, this.clientId as number, 1, 'req', rd.verify)
+        const frame = await this.v2.frameEncrypt(this.ek, rd.verify, this.clientId as number, 1, 'req', rd.verify)
         const proof = await this.send('apiPrivateAuth', { frame })
         this.cipher = true
         this.level = proof.resultData ? proof.resultData.level : this.level
@@ -384,7 +278,7 @@ export default class VRackRemote extends EventEmitter {
 
         const job = async () => {
             const text = this.cipher
-                ? await frameEncrypt(payload, this.ek as Uint8Array, this.clientId as number, reqSeq, 'req', this.session as string)
+                ? await this.v2.frameEncrypt(this.ek as CryptoKey, payload, this.clientId as number, reqSeq, 'req', this.session as string)
                 : payload
             this.transportSend(text)
         }

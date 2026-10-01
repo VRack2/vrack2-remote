@@ -22,6 +22,8 @@ export default class VRackRemote extends EventEmitter {
     }>;
     protected queueTimeout: Map<number, number>;
     private sendChain;
+    private _v2?;
+    private get v2();
     level: number;
     timeout: number;
     connected: boolean;
@@ -38,7 +40,7 @@ export default class VRackRemote extends EventEmitter {
     };
     clientId: number | null;
     session: string | null;
-    ek: Uint8Array | null;
+    ek: CryptoKey | null;
     reqSeq: number;
     resSeq: number;
     constructor(key?: string, privateKey?: string);
